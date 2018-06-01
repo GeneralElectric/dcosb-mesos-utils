@@ -6,7 +6,6 @@ import akka.actor.{Actor, ActorSystem, Props}
 import akka.http.scaladsl.model.{DateTime => _, _}
 import akka.http.scaladsl.server.ContentNegotiator.Alternative.ContentType
 import akka.testkit.{CallingThreadDispatcher, TestActorRef, TestKit}
-import io.predix.dcosb.mesos.MesosApiClient
 import org.scalatest.{FreeSpecLike, Matchers}
 import org.scalamock.scalatest.MockFactory
 import akka.pattern._
@@ -17,9 +16,8 @@ import com.typesafe.config.ConfigFactory
 import io.predix.dcosb.util.ActorSuite
 import io.predix.dcosb.util.actor.ConfiguredActor
 import akka.http.scaladsl.marshalling.Marshal
-import io.predix.dcosb.mesos.MesosApiClient.Master.{InsufficientPermissionsToUnreserve, ReservationNotFound, ResourceUnreservationResults, ResourceUnreserved}
+import io.predix.dcosb.mesos.MesosApiClient.Master._
 import io.predix.dcosb.mesos.MesosApiClient.MesosApiModel.Master
-import io.predix.dcosb.mesos.MesosApiClient.MesosApiModel.Master.Frameworks._
 
 import collection.JavaConverters._
 import scala.collection.immutable.HashMap
@@ -33,16 +31,27 @@ class MesosApiClientTest extends ActorSuite {
   implicit val executionContext = system.dispatchers.lookup(CallingThreadDispatcher.Id)
   implicit val timeout = Timeout(FiniteDuration(5, TimeUnit.SECONDS))
 
-  "A configured MesosApiClient" - {
+  trait HttpClientMock {
 
     val httpClient = mockFunction[HttpRequest, String, Future[(HttpResponse, String)]]
 
-    val apiClient = TestActorRef(Props(classOf[MesosApiClient]).withDispatcher(CallingThreadDispatcher.Id))
-    apiClient ! MesosApiClient.Configuration(httpClient)
-    expectMsg(Success(ConfiguredActor.Configured()))
+  }
+
+
+
+  "A configured MesosApiClient" - {
+
+    trait ConfiguredMesosApiClient extends HttpClientMock {
+
+      val apiClient = TestActorRef(Props(classOf[MesosApiClient]).withDispatcher(CallingThreadDispatcher.Id))
+      apiClient ! MesosApiClient.Configuration(httpClient)
+      expectMsg(Success(ConfiguredActor.Configured()))
+
+    }
+
 
     import MesosApiClient.MesosApiModel
-    "responds with a sequence of Role objects to the message GetRoles" in {
+    "responds with a sequence of Role objects to the message GetRoles" in new ConfiguredMesosApiClient {
       import MesosApiClient.MesosApiModel.Master.Roles.{RolesResponse,Role,Resources}
 
       val json = Source.fromURL(getClass.getResource("/roles.json")).getLines.mkString
@@ -51,9 +60,7 @@ class MesosApiClientTest extends ActorSuite {
 
       // verify respomnse is Seq[Role]
       implicit val timeout: Timeout = Timeout(FiniteDuration(5, TimeUnit.SECONDS))
-      (apiClient ? MesosApiClient.Master.GetRoles()) onComplete {
-        case Success(Success(roles: Seq[MesosApiModel.Master.Roles.Role])) =>
-          roles shouldEqual List(
+      Await.result(apiClient ? MesosApiClient.Master.GetRoles(), timeout.duration) shouldEqual Success(List(
             Role(
               frameworks = List("62033811-f2cd-47f1-97a1-a3b2f28802a4-0000"),
               name = "*",
@@ -102,13 +109,13 @@ class MesosApiClientTest extends ActorSuite {
               ),
               weight = 1.0d
             )
-          )
-      }
+          ))
+
 
     }
 
 
-    "responds with a sequence of Slave objects to the message GetSlaves" in {
+    "responds with a sequence of Slave objects to the message GetSlaves" in new ConfiguredMesosApiClient {
       import MesosApiClient.MesosApiModel.Master.Slaves.{Disk, Label, Labels, Persistence, PrincipalAndLabels, Range, Ranges, ResourceReservation, Scalar, Slave, Volume}
 
       val json = Source.fromURL(getClass.getResource("/slaves.json")).getLines.mkString
@@ -117,9 +124,7 @@ class MesosApiClientTest extends ActorSuite {
 
       // verify response is Seq[Slave]
       implicit val timeout: Timeout = Timeout(FiniteDuration(5, TimeUnit.SECONDS))
-      (apiClient ? MesosApiClient.Master.GetSlaves()) onComplete {
-        case Success(Success(slaves: Seq[MesosApiModel.Master.Slaves.Slave])) =>
-          slaves shouldEqual List(
+      Await.result(apiClient ? MesosApiClient.Master.GetSlaves(), timeout.duration) shouldEqual Success(List(
             Slave(
               id = "f18fcd65-5c63-4dfb-b233-f289aac416c5-S43",
               pid = "slave(1)@10.72.154.222:5051",
@@ -205,85 +210,136 @@ class MesosApiClientTest extends ActorSuite {
                   )
                 )
               )
-            ))
-        case r => fail(s"Unexpected response from MesosApiClient: $r")
-      }
+            )))
+
 
     }
 
-    "responds with a sequence of Framework objects to the message GetFrameworks" in {
-      import MesosApiClient.MesosApiModel.Master.Frameworks.{Framework, Task, Status, ContainerStatus, ContainerId}
+    import MesosApiClient.MesosApiModel.Master.Frameworks.{Framework, Task, Status, ContainerStatus, ContainerId, Discovery, Ports, Port, Protocol, Visibility}
+    trait FrameworksHttpResponse extends ConfiguredMesosApiClient {
 
       val json = Source.fromURL(getClass.getResource("/frameworks.json")).getLines.mkString
-
       httpClient expects(*, *) returning Future.successful((HttpResponse(entity = HttpEntity(ContentTypes.`application/json`, json)), ""))
+    }
+
+    trait EmptyFrameworksHttpResponse extends ConfiguredMesosApiClient {
+
+      httpClient expects(*, *) returning Future.successful((HttpResponse(entity = HttpEntity(ContentTypes.`application/json`, """{"frameworks":[],"unregistered_frameworks":[],"completed_frameworks":[]}""")), ""))
+
+    }
+
+    trait FrameworkStub {
+
+      val frakework = Framework(
+        id = "62033811-f2cd-47f1-97a1-a3b2f28802a4-0007",
+        name = "predix-demo-1",
+        pid = "scheduler-050103fc-664a-49ed-9bc2-d2100d9fb5f4@10.42.60.66:59180",
+        active = true,
+        role = "predix-demo-1-role",
+        principal = Some("cassandra-principal"),
+        tasks = List(
+          Task(
+            id = "node-1__bf5de62a-ab45-4843-8cd0-0fbca2c5e4c0",
+            name = "node-1",
+            slave_id = "62033811-f2cd-47f1-97a1-a3b2f28802a4-S2",
+            state = "TASK_RUNNING",
+            statuses = List(
+              Status(
+                state = "TASK_RUNNING",
+                container_status = ContainerStatus(
+                  container_id = ContainerId("4f9af14a-abbf-4558-af92-32496565d1aa")
+                )
+              )
+            ),
+            discovery = Some(Discovery(
+              visibility = Some(Visibility.EXTERNAL),
+              name = "node-1",
+              ports = Some(Ports(
+                ports = Some(List(Port(number = 25525, protocol = Protocol.TCP, visibility = None, name = None)))
+              ))
+            ))
+          ),
+          Task(
+            id = "node-0__9228c40a-ceb6-48f7-9a33-b7b8fe8af011",
+            name = "node-0",
+            slave_id = "62033811-f2cd-47f1-97a1-a3b2f28802a4-S1",
+            state = "TASK_RUNNING",
+            statuses = List(
+              Status(
+                state = "TASK_RUNNING",
+                container_status = ContainerStatus(
+                  container_id = ContainerId("d73fa218-5e65-4bd4-9209-0cefa82398b0")
+                )
+              )
+            ),
+            discovery = Some(Discovery(
+              visibility = Some(Visibility.EXTERNAL),
+              name = "node-0",
+              ports = Some(Ports(
+                ports = Some(List(Port(number = 25525, protocol = Protocol.TCP, visibility = None, name = None)))
+              ))
+            ))
+
+          )
+        ),
+        unreachable_tasks = List()
+      )
+
+    }
+
+    "responds with a sequence of Framework objects to the message GetFrameworks" in new FrameworksHttpResponse with FrameworkStub {
 
       // verify response is Seq[Frameworks]
       implicit val timeout: Timeout = Timeout(FiniteDuration(5, TimeUnit.SECONDS))
 
-      (apiClient ? MesosApiClient.Master.GetFrameworks()) onComplete {
-        case Success(Success(frameworks: Seq[MesosApiModel.Master.Frameworks.Framework])) =>
-          frameworks shouldEqual List(
-            Framework(
-              id = "62033811-f2cd-47f1-97a1-a3b2f28802a4-0007",
-              name = "predix-demo-1",
-              pid = "scheduler-050103fc-664a-49ed-9bc2-d2100d9fb5f4@10.42.60.66:59180",
-              active = true,
-              role = "predix-demo-1-role",
-              principal = Some("cassandra-principal"),
-              tasks = List(
-                Task(
-                  id = "node-1__bf5de62a-ab45-4843-8cd0-0fbca2c5e4c0",
-                  name = "node-1",
-                  slave_id = "62033811-f2cd-47f1-97a1-a3b2f28802a4-S2",
-                  state = "TASK_RUNNING",
-                  statuses = List(
-                    Status(
-                      state = "TASK_RUNNING",
-                      container_status = ContainerStatus(
-                        container_id = ContainerId("4f9af14a-abbf-4558-af92-32496565d1aa")
-                      )
-                    )
-                  ),
-                  discovery = Some(Discovery(
-                    visibility = Some(Visibility.EXTERNAL),
-                    name = "node-1",
-                    ports = Some(Ports(
-                      ports = Some(List(Port(number = 25525, protocol = Protocol.TCP, visibility = None, name = None)))
-                    ))
-                  ))
-                ),
-                Task(
-                  id = "node-0__9228c40a-ceb6-48f7-9a33-b7b8fe8af011",
-                  name = "node-0",
-                  slave_id = "62033811-f2cd-47f1-97a1-a3b2f28802a4-S1",
-                  state = "TASK_RUNNING",
-                  statuses = List(
-                    Status(
-                      state = "TASK_RUNNING",
-                      container_status = ContainerStatus(
-                        container_id = ContainerId("d73fa218-5e65-4bd4-9209-0cefa82398b0")
-                      )
-                    )
-                  ),
-                  discovery = Some(Discovery(
-                    visibility = Some(Visibility.EXTERNAL),
-                    name = "node-0",
-                    ports = Some(Ports(
-                      ports = Some(List(Port(number = 25525, protocol = Protocol.TCP, visibility = None, name = None)))
-                    ))
-                  ))
+      Await.result(apiClient ? MesosApiClient.Master.GetFrameworks(), timeout.duration) shouldEqual Success(List(frakework))
 
-                )
-              ),
-              unreachable_tasks = List()
-            )
 
-          )
+    }
 
-        case r => fail(s"Unexpected response from MesosApiClient: $r")
+    "given a GetFramework message" - {
+
+      "with an existing framework id" - {
+
+        "responds with a Success(Framework) object for the provided framework id" in new FrameworksHttpResponse with FrameworkStub {
+
+          implicit val timeout: Timeout = Timeout(FiniteDuration(5, TimeUnit.SECONDS))
+
+          Await.result(apiClient ? MesosApiClient.Master.GetFramework("62033811-f2cd-47f1-97a1-a3b2f28802a4-0007"), timeout.duration) shouldEqual Success(frakework)
+
+
+
+        }
 
       }
+
+      "with a non-existant framework id" - {
+
+        "responds with a Failure(FrameworkNotFound) object" in new EmptyFrameworksHttpResponse {
+
+          implicit val timeout: Timeout = Timeout(FiniteDuration(5, TimeUnit.SECONDS))
+          Await.result(apiClient ? MesosApiClient.Master.GetFramework("foo"), timeout.duration) shouldEqual Failure(FrameworkNotFound("foo"))
+
+        }
+
+      }
+
+    }
+
+    "responds with a StateSummary object to the message GetStateSummary" in new ConfiguredMesosApiClient {
+      import io.predix.dcosb.mesos.MesosApiClient.MesosApiModel.Master.StateSummary._
+
+      val summary = MesosApiClient.Master.StateSummary(
+        frameworks = List(
+          FrameworkSummary(
+            id = "foo-id",
+            name = "foo-name")))
+
+      httpClient expects(*, *) returning Future.successful((HttpResponse(entity = HttpEntity(ContentTypes.`application/json`, """{"frameworks":[{"id":"foo-id","name":"foo-name"}]}""")), ""))
+
+      implicit val timeout: Timeout = Timeout(FiniteDuration(5, TimeUnit.SECONDS))
+      Await.result(apiClient? MesosApiClient.Master.GetStateSummary(), timeout.duration) shouldEqual
+        Success(summary)
 
     }
 
@@ -392,7 +448,7 @@ class MesosApiClientTest extends ActorSuite {
         )
 
       ))
-      "utilises it's configured http client to unreserve these resources on all slaves" in new Master.JsonSupport{
+      "utilises it's configured http client to unreserve these resources on all slaves" in new Master.JsonSupport with ConfiguredMesosApiClient {
 
         httpClient expects(*,*) onCall { (request, context) =>
         context match {
@@ -680,6 +736,30 @@ class MesosApiClientJsonSupportTest extends FreeSpecLike with Matchers {
           )))
 
 
+
+    }
+
+  }
+
+  "given a valid json string representing master state summary" - {
+
+    val json = Source.fromURL(getClass.getResource("/state-summary.json")).getLines.mkString
+
+    "formats in implicit scope in JsonSupport should create an object graph representing master state summary" in {
+      import io.predix.dcosb.mesos.MesosApiClient.MesosApiModel.Master.StateSummary._
+
+      val parser = new JsonSupport {
+
+        def fromString(json: String): StateSummaryResponse = stateSummaryResponseFormat.read(json.parseJson)
+
+      }
+
+      parser.fromString(json) shouldEqual
+        StateSummaryResponse(
+          frameworks = List(
+            FrameworkSummary(
+              id = "1a5c08b6-4138-4205-aeab-630cbeb99b22-0000",
+              name = "metronome")))
 
     }
 

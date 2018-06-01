@@ -4,11 +4,12 @@ import akka.actor.{Actor, ActorLogging, ActorRef}
 import akka.event.LoggingReceive
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport
 import akka.http.scaladsl.marshalling.Marshal
+import akka.http.scaladsl.model.Uri.Query
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.unmarshalling.Unmarshal
 import akka.stream.{ActorMaterializer, ActorMaterializerSettings}
 import io.predix.dcosb.config.model.DCOSClusterConnectionParameters
-import io.predix.dcosb.mesos.MesosApiClient.Master.ResourceUnreservationResults
+import io.predix.dcosb.mesos.MesosApiClient.Master.{FrameworkNotFound, ResourceUnreservationResults}
 import io.predix.dcosb.mesos.MesosApiClient.MesosApiModel.Master.Slaves.{ResourceReservation, SlavesResponse}
 import io.predix.dcosb.util.{AsyncUtils, JsonFormats}
 import io.predix.dcosb.util.actor.HttpClientActor
@@ -27,15 +28,24 @@ object MesosApiClient {
 
   class MesosApiClientNotFoundException extends Exception
 
+  case class UnexpectedResponse(resp: HttpResponse) extends Throwable {
+    override def toString: String = {
+      super.toString + s", $resp"
+    }
+  }
+
   object Master {
 
     // handled messages
     case class GetSlaves()
     case class GetRoles()
     case class GetFrameworks()
+    case class GetFramework(frameworkId: String)
+    case class GetStateSummary()
     case class Unreserve(resourceReservations: Map[String, Seq[ResourceReservation]])
 
     // response messages
+    case class StateSummary(frameworks: Seq[MesosApiModel.Master.StateSummary.FrameworkSummary])
     trait ResourceUnreservationResult
     case class ResourceUnreserved(reservation: ResourceReservation) extends ResourceUnreservationResult
     case class ReservationNotFound(reservation: ResourceReservation) extends ResourceUnreservationResult
@@ -43,6 +53,8 @@ object MesosApiClient {
     case class UnexpectedResponseWhileUnreserving(reservation: ResourceReservation, response: HttpResponse) extends ResourceUnreservationResult
     case class ExceptionWhileUnreserving(e: Throwable) extends ResourceUnreservationResult
     case class ResourceUnreservationResults(resourceReservations: Iterable[_ >: ResourceUnreservationResult])
+
+    case class FrameworkNotFound(frameworkId: String) extends Throwable
 
   }
 
@@ -196,7 +208,21 @@ object MesosApiClient {
 
       }
 
-      trait JsonSupport extends Slaves.JsonSupport with Frameworks.JsonSupport with Roles.JsonSupport
+      object StateSummary {
+
+        case class FrameworkSummary(id: String, name: String)
+        case class StateSummaryResponse(frameworks: Seq[FrameworkSummary])
+
+        trait JsonSupport extends SprayJsonSupport with DefaultJsonProtocol {
+
+          implicit val frameworkSummaryFormat = jsonFormat2(FrameworkSummary)
+          implicit val stateSummaryResponseFormat = jsonFormat1(StateSummaryResponse)
+
+        }
+
+      }
+
+      trait JsonSupport extends Slaves.JsonSupport with Frameworks.JsonSupport with Roles.JsonSupport with StateSummary.JsonSupport
 
     }
 
@@ -212,6 +238,9 @@ object MesosApiClient {
 class MesosApiClient extends ConfiguredActor[MesosApiClient.Configuration] with ActorLogging with HttpClientActor with MesosApiClient.MesosApiModel.JsonSupport {
   import MesosApiClient._
 
+  implicit val ec = context.dispatcher
+  implicit val mat = ActorMaterializer(ActorMaterializerSettings(context.system))
+
   override def configure(configuration: MesosApiClient.Configuration): Future[Configured] = {
     super.configure(configuration)
     this.httpClient = Some(configuration.httpClient)
@@ -226,6 +255,8 @@ class MesosApiClient extends ConfiguredActor[MesosApiClient.Configuration] with 
     case _: Master.GetSlaves => broadcastFuture(getSlaves(), sender())
     case _: Master.GetRoles => broadcastFuture(getRoles(), sender())
     case _: Master.GetFrameworks => broadcastFuture(getFrameworks(), sender())
+    case Master.GetFramework(frameworkId: String) => broadcastFuture(getFramework(frameworkId), sender())
+    case _: Master.GetStateSummary => broadcastFuture(getStateSummary(), sender())
     case Master.Unreserve(reservations: Map[String, Seq[ResourceReservation]]) => broadcastFuture(unreserve(reservations), sender())
 
   }
@@ -236,11 +267,19 @@ class MesosApiClient extends ConfiguredActor[MesosApiClient.Configuration] with 
 
     def `sendRequest, unmarshall and fulfill promise`(request: HttpRequest, p: Promise[Seq[MesosApiModel.Master.Roles.Role]]): Unit = {
 
-      `sendRequest and unmarshall entity`[MesosApiModel.Master.Roles.RolesResponse](request, (response: Try[MesosApiModel.Master.Roles.RolesResponse]) => {
-        response match {
-          case Success(rolesResponse: MesosApiModel.Master.Roles.RolesResponse) => promise.success(rolesResponse.roles)
-          case Failure(e: Throwable) => promise.failure(e)
-        }
+      `sendRequest and handle response`(request, {
+        case Success(HttpResponse(StatusCodes.OK, _, re, _)) =>
+          Unmarshal(re).to[MesosApiModel.Master.Roles.RolesResponse] onComplete {
+            case Success(rolesResponse: MesosApiModel.Master.Roles.RolesResponse) => promise.success(rolesResponse.roles)
+            case Failure(e: Throwable) =>
+              re.discardBytes()
+              promise.failure(e)
+          }
+        case Success(r: HttpResponse) =>
+          r.entity.discardBytes()
+          promise.failure(new UnexpectedResponse(r))
+        case Failure(e: Throwable) =>
+          promise.failure(e)
       })
 
     }
@@ -264,11 +303,19 @@ class MesosApiClient extends ConfiguredActor[MesosApiClient.Configuration] with 
 
     def `sendRequest, unmarshall and fulfill promise`(request: HttpRequest, p: Promise[Seq[MesosApiModel.Master.Slaves.Slave]]): Unit = {
 
-      `sendRequest and unmarshall entity`[MesosApiModel.Master.Slaves.SlavesResponse](request, (response: Try[MesosApiModel.Master.Slaves.SlavesResponse]) => {
-        response match {
-          case Success(slavesResponse: MesosApiModel.Master.Slaves.SlavesResponse) => promise.success(slavesResponse.slaves)
-          case Failure(e: Throwable) => promise.failure(e)
-        }
+      `sendRequest and handle response`(request, {
+        case Success(HttpResponse(StatusCodes.OK, _, re, _)) =>
+          Unmarshal(re).to[MesosApiModel.Master.Slaves.SlavesResponse] onComplete {
+            case Success(slavesResponse: MesosApiModel.Master.Slaves.SlavesResponse) => promise.success(slavesResponse.slaves)
+            case Failure(e: Throwable) =>
+              re.discardBytes()
+              promise.failure(e)
+          }
+        case Success(r: HttpResponse) =>
+          r.entity.discardBytes()
+          promise.failure(new UnexpectedResponse(r))
+        case Failure(e: Throwable) =>
+          promise.failure(e)
       })
 
     }
@@ -292,11 +339,19 @@ class MesosApiClient extends ConfiguredActor[MesosApiClient.Configuration] with 
     val promise = Promise[Seq[MesosApiModel.Master.Frameworks.Framework]]()
     def `sendRequest, unmarshall and fulfill promise`(request: HttpRequest, p: Promise[Seq[MesosApiModel.Master.Frameworks.Framework]]): Unit = {
 
-      `sendRequest and unmarshall entity`[MesosApiModel.Master.Frameworks.FrameworksResponse](request, (response: Try[MesosApiModel.Master.Frameworks.FrameworksResponse]) => {
-        response match {
-          case Success(frameworksResponse: MesosApiModel.Master.Frameworks.FrameworksResponse) => promise.success(frameworksResponse.frameworks)
-          case Failure(e: Throwable) => promise.failure(e)
-        }
+      `sendRequest and handle response`(request, {
+        case Success(HttpResponse(StatusCodes.OK, _, re, _)) =>
+          Unmarshal(re).to[MesosApiModel.Master.Frameworks.FrameworksResponse] onComplete {
+            case Success(frameworksResponse: MesosApiModel.Master.Frameworks.FrameworksResponse) => promise.success(frameworksResponse.frameworks)
+            case Failure(e: Throwable) =>
+              re.discardBytes()
+              promise.failure(e)
+          }
+        case Success(r: HttpResponse) =>
+          r.entity.discardBytes()
+          promise.failure(new UnexpectedResponse(r))
+        case Failure(e: Throwable) =>
+          promise.failure(e)
       })
 
     }
@@ -310,6 +365,77 @@ class MesosApiClient extends ConfiguredActor[MesosApiClient.Configuration] with 
     })
 
     promise.future
+  }
+
+  def getFramework(frameworkId: String) = {
+    log.debug(s"Handling getFrameworks($frameworkId)")
+    val promise = Promise[MesosApiModel.Master.Frameworks.Framework]()
+    def `sendRequest, unmarshall and fulfill promise`(request: HttpRequest, p: Promise[MesosApiModel.Master.Frameworks.Framework]): Unit = {
+
+      `sendRequest and handle response`(request, {
+        case Success(HttpResponse(StatusCodes.OK, _, re, _)) =>
+          Unmarshal(re).to[MesosApiModel.Master.Frameworks.FrameworksResponse] onComplete {
+            case Success(frameworksResponse: MesosApiModel.Master.Frameworks.FrameworksResponse) if frameworksResponse.frameworks.size > 0 => promise.success(frameworksResponse.frameworks.head)
+            case Success(frameworksResponse: MesosApiModel.Master.Frameworks.FrameworksResponse) => promise.failure(FrameworkNotFound(frameworkId))
+            case Failure(e: Throwable) =>
+              re.discardBytes()
+              promise.failure(e)
+          }
+        case Success(r: HttpResponse) =>
+          r.entity.discardBytes()
+          promise.failure(new UnexpectedResponse(r))
+        case Failure(e: Throwable) =>
+          promise.failure(e)
+      })
+
+    }
+
+    configured((configuration) => {
+
+      `sendRequest, unmarshall and fulfill promise`( HttpRequest(
+        method = HttpMethods.GET,
+        uri = s"/mesos/frameworks?framework_id=$frameworkId"), promise )
+
+    })
+
+    promise.future
+
+
+  }
+
+  def getStateSummary() = {
+    log.debug("Handling getStateSummary()")
+
+    val promise = Promise[MesosApiClient.Master.StateSummary]()
+    def `sendRequest, unmarshall and fulfill promise`(request: HttpRequest, p: Promise[MesosApiClient.Master.StateSummary]): Unit = {
+
+      `sendRequest and handle response`(request, {
+        case Success(HttpResponse(StatusCodes.OK, _, re, _)) =>
+          Unmarshal(re).to[MesosApiModel.Master.StateSummary.StateSummaryResponse] onComplete {
+            case Success(stateSummaryResponse: MesosApiModel.Master.StateSummary.StateSummaryResponse) => promise.success(MesosApiClient.Master.StateSummary(stateSummaryResponse.frameworks))
+            case Failure(e: Throwable) =>
+              re.discardBytes()
+              promise.failure(e)
+          }
+        case Success(r: HttpResponse) =>
+          r.entity.discardBytes()
+          promise.failure(new UnexpectedResponse(r))
+        case Failure(e: Throwable) =>
+          promise.failure(e)
+      })
+
+    }
+
+    configured((configuration) => {
+
+      `sendRequest, unmarshall and fulfill promise`( HttpRequest(
+        method = HttpMethods.GET,
+        uri = "/mesos/state-summary"), promise )
+
+    })
+
+    promise.future
+
   }
 
   def unreserve(r: Map[String, Seq[ResourceReservation]]): Future[Master.ResourceUnreservationResults] = {
